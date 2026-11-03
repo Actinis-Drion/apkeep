@@ -18,7 +18,7 @@ use crate::util::{OutputFormat, progress_bar::progress_wrapper};
 fn http_headers(options: &HashMap<&str, &str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("x-cv", HeaderValue::from_static("3172501"));
-    headers.insert("x-sv", HeaderValue::from_static("29"));
+    headers.insert("x-sv", sdk_header(options));
     let arch = match options.get("arch"){
         Some(arch) => {
             arch.split(";").collect::<Vec<_>>().join(",")
@@ -40,6 +40,61 @@ fn http_headers(options: &HashMap<&str, &str>) -> HeaderMap {
     headers
 }
 
+/// The `x-sv` header: the device SDK level APKPure filters its variants by.
+/// `sdk=<level>` overrides the historical default of 29, so a caller can ask
+/// for the builds a current device would get.
+fn sdk_header(options: &HashMap<&str, &str>) -> HeaderValue {
+    match options.get("sdk") {
+        Some(sdk) if !sdk.is_empty() && sdk.len() <= 3 && sdk.bytes().all(|b| b.is_ascii_digit()) => {
+            HeaderValue::from_str(sdk).unwrap()
+        },
+        Some(_) => {
+            println!("Invalid sdk option specified, using the default SDK level 29.");
+            HeaderValue::from_static("29")
+        },
+        None => HeaderValue::from_static("29"),
+    }
+}
+
+/// True when `all_variants=true` asks for every descriptor of an exact
+/// version instead of only the first one APKPure lists.
+fn all_variants(options: &HashMap<&str, &str>) -> bool {
+    matches!(options.get("all_variants"), Some(val) if *val == "1" || val.to_lowercase() == "true")
+}
+
+/// The (kind, URL) of each download descriptor `re` finds in `body`, in the
+/// order APKPure lists them, without repeats; only the first unless `all`.
+fn download_descriptors(re: &Regex, body: &str, all: bool) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut descriptors = Vec::new();
+    for caps in re.captures_iter(body) {
+        let (Some(kind), Some(url)) = (caps.get(1), caps.get(2)) else {
+            continue;
+        };
+        if seen.insert(url.as_str().to_string()) {
+            descriptors.push((kind.as_str().to_string(), url.as_str().to_string()));
+            if !all {
+                break;
+            }
+        }
+    }
+    descriptors
+}
+
+/// The file name for descriptor `index` of `count`: numbered only when there
+/// are several, so a single download keeps its historical name.
+fn descriptor_file_name(app_string: &str, kind: &str, index: usize, count: usize) -> String {
+    let extension = match kind {
+        "XAPKJ" => "xapk",
+        _ => "apk",
+    };
+    if count > 1 {
+        format!("{}.variant{}.{}", app_string, index + 1, extension)
+    } else {
+        format!("{}.{}", app_string, extension)
+    }
+}
+
 pub async fn download_apps(
     apps: Vec<(String, Option<String>)>,
     parallel: usize,
@@ -58,6 +113,7 @@ pub async fn download_apps(
     let mp = Rc::new(MultiProgress::new());
     let http_client = Rc::new(reqwest::Client::new());
     let app_arch = options.get("arch").cloned();
+    let all_variants = all_variants(&options);
     let headers = http_headers(&options);
     let re = Rc::new(Regex::new(crate::consts::APKPURE_DOWNLOAD_URL_REGEX).unwrap());
 
@@ -99,77 +155,145 @@ pub async fn download_apps(
                 if let Some(app_version) = app_version {
                     let regex_string = format!("[[:^digit:]]{}:(?s:.)+?{}", regex::escape(&app_version), crate::consts::APKPURE_DOWNLOAD_URL_REGEX);
                     let re = Regex::new(&regex_string).unwrap();
-                    download_from_response(versions_response, Box::new(Box::new(re)), app_string, outpath, mp).await;
+                    download_from_response(versions_response, Box::new(Box::new(re)), app_string, outpath, mp, all_variants).await;
                 } else {
-                    download_from_response(versions_response, Box::new(re), app_string, outpath, mp).await;
+                    download_from_response(versions_response, Box::new(re), app_string, outpath, mp, false).await;
                 }
             }
         })
     ).buffer_unordered(parallel).collect::<Vec<()>>().await;
 }
 
-async fn download_from_response(response: Response, re: Box<dyn Deref<Target=Regex>>, app_string: String, outpath: &Path, mp: Rc<MultiProgress>) {
+async fn download_from_response(response: Response, re: Box<dyn Deref<Target=Regex>>, app_string: String, outpath: &Path, mp: Rc<MultiProgress>, all: bool) {
     let mp_log = Rc::clone(&mp);
-    let mp = Rc::clone(&mp);
     match response.status() {
         reqwest::StatusCode::OK => {
             let body = response.text().await.unwrap();
-            match re.captures(&body) {
-                Some(caps) if caps.len() >= 2 => {
-                    let apk_xapk = caps.get(1).unwrap().as_str();
-                    let download_url = caps.get(2).unwrap().as_str();
-                    let fname = match apk_xapk {
-                        "XAPKJ" => format!("{}.xapk", app_string),
-                        _ => format!("{}.apk", app_string),
-                    };
-
-                    match AsyncDownload::new(download_url, Path::new(outpath), &fname).get().await {
-                        Ok(mut dl) => {
-                            let length = dl.length();
-                            let cb = match length {
-                                Some(length) => Some(progress_wrapper(mp)(fname.clone(), length)),
-                                None => None,
-                            };
-
-                            match dl.download(&cb).await {
-                                Ok(_) => mp_log.suspend(|| println!("{} downloaded successfully!", app_string)),
-                                Err(err) if matches!(err.kind(), TDSTDErrorKind::FileExists) => {
-                                    mp_log.println(format!("File already exists for {}. Skipping...", app_string)).unwrap();
-                                },
-                                Err(err) if matches!(err.kind(), TDSTDErrorKind::PermissionDenied) => {
-                                    mp_log.println(format!("Permission denied when attempting to write file for {}. Skipping...", app_string)).unwrap();
-                                },
-                                Err(_) => {
-                                    mp_log.println(format!("An error has occurred attempting to download {}.  Retry #1...", app_string)).unwrap();
-                                    match AsyncDownload::new(download_url, Path::new(outpath), &fname).download(&cb).await {
-                                        Ok(_) => mp_log.suspend(|| println!("{} downloaded successfully!", app_string)),
-                                        Err(_) => {
-                                            mp_log.println(format!("An error has occurred attempting to download {}.  Retry #2...", app_string)).unwrap();
-                                            match AsyncDownload::new(download_url, Path::new(outpath), &fname).download(&cb).await {
-                                                Ok(_) => mp_log.suspend(|| println!("{} downloaded successfully!", app_string)),
-                                                Err(_) => {
-                                                    mp_log.println(format!("An error has occurred attempting to download {}. Skipping...", app_string)).unwrap();
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        Err(_) => {
-                            mp_log.println(format!("Invalid response for {}. Skipping...", app_string)).unwrap();
-                        }
-                    }
-                },
-                _ => {
-                    mp_log.println(format!("Could not get download URL for {}. Skipping...", app_string)).unwrap();
-                }
+            let descriptors = download_descriptors(&re, &body, all);
+            if descriptors.is_empty() {
+                mp_log.println(format!("Could not get download URL for {}. Skipping...", app_string)).unwrap();
+                return;
             }
-
+            let count = descriptors.len();
+            for (index, (kind, download_url)) in descriptors.iter().enumerate() {
+                let fname = descriptor_file_name(&app_string, kind, index, count);
+                download_file(download_url, &fname, &app_string, outpath, Rc::clone(&mp)).await;
+            }
         },
         _ => {
             mp_log.println(format!("Invalid app response for {}. Skipping...", app_string)).unwrap();
         }
+    }
+}
+
+async fn download_file(download_url: &str, fname: &str, app_string: &str, outpath: &Path, mp: Rc<MultiProgress>) {
+    let mp_log = Rc::clone(&mp);
+    match AsyncDownload::new(download_url, Path::new(outpath), fname).get().await {
+        Ok(mut dl) => {
+            let length = dl.length();
+            let cb = match length {
+                Some(length) => Some(progress_wrapper(mp)(fname.to_string(), length)),
+                None => None,
+            };
+
+            match dl.download(&cb).await {
+                Ok(_) => mp_log.suspend(|| println!("{} downloaded successfully!", fname)),
+                Err(err) if matches!(err.kind(), TDSTDErrorKind::FileExists) => {
+                    mp_log.println(format!("File already exists for {}. Skipping...", fname)).unwrap();
+                },
+                Err(err) if matches!(err.kind(), TDSTDErrorKind::PermissionDenied) => {
+                    mp_log.println(format!("Permission denied when attempting to write file for {}. Skipping...", fname)).unwrap();
+                },
+                Err(_) => {
+                    mp_log.println(format!("An error has occurred attempting to download {}.  Retry #1...", fname)).unwrap();
+                    match AsyncDownload::new(download_url, Path::new(outpath), fname).download(&cb).await {
+                        Ok(_) => mp_log.suspend(|| println!("{} downloaded successfully!", fname)),
+                        Err(_) => {
+                            mp_log.println(format!("An error has occurred attempting to download {}.  Retry #2...", fname)).unwrap();
+                            match AsyncDownload::new(download_url, Path::new(outpath), fname).download(&cb).await {
+                                Ok(_) => mp_log.suspend(|| println!("{} downloaded successfully!", fname)),
+                                Err(_) => {
+                                    mp_log.println(format!("An error has occurred attempting to download {}. Skipping...", fname)).unwrap();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        Err(_) => {
+            mp_log.println(format!("Invalid response for {}. Skipping...", app_string)).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options<'a>(pairs: &[(&'a str, &'a str)]) -> HashMap<&'a str, &'a str> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn sdk_defaults_to_29_and_takes_a_numeric_override() {
+        assert_eq!(sdk_header(&options(&[])), "29");
+        assert_eq!(sdk_header(&options(&[("sdk", "36")])), "36");
+        assert_eq!(http_headers(&options(&[("sdk", "36")]))["x-sv"], "36");
+    }
+
+    #[test]
+    fn a_non_numeric_sdk_falls_back_to_29() {
+        for bad in ["", "3x", "1000", "36\n"] {
+            assert_eq!(sdk_header(&options(&[("sdk", bad)])), "29", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn all_variants_needs_an_explicit_true() {
+        assert!(!all_variants(&options(&[])));
+        assert!(!all_variants(&options(&[("all_variants", "no")])));
+        assert!(all_variants(&options(&[("all_variants", "TRUE")])));
+        assert!(all_variants(&options(&[("all_variants", "1")])));
+    }
+
+    const BODY: &str = "\u{12}1.2.3:\u{8}XAPKJ\u{1}\u{2}https://d.example.com/a.xapk?k=1\u{0} \
+        \u{12}1.2.3:\u{8}XAPKJ\u{1}\u{2}https://d.example.com/b.xapk?k=2\u{0} \
+        \u{12}1.2.3:\u{8}XAPKJ\u{1}\u{2}https://d.example.com/a.xapk?k=1\u{0} \
+        \u{12}1.2.4:\u{8}APKJ\u{1}\u{2}https://d.example.com/c.apk\u{0}";
+
+    fn version_regex(version: &str) -> Regex {
+        Regex::new(&format!(
+            "[[:^digit:]]{}:(?s:.)+?{}",
+            regex::escape(version),
+            crate::consts::APKPURE_DOWNLOAD_URL_REGEX
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_first_descriptor_alone_by_default() {
+        let found = download_descriptors(&version_regex("1.2.3"), BODY, false);
+        assert_eq!(found, vec![("XAPKJ".to_string(), "https://d.example.com/a.xapk?k=1".to_string())]);
+    }
+
+    #[test]
+    fn every_distinct_descriptor_of_the_version_with_all_variants() {
+        let urls: Vec<String> = download_descriptors(&version_regex("1.2.3"), BODY, true)
+            .into_iter()
+            .map(|(_, url)| url)
+            .collect();
+        assert!(urls.starts_with(&[
+            "https://d.example.com/a.xapk?k=1".to_string(),
+            "https://d.example.com/b.xapk?k=2".to_string(),
+        ]));
+        assert_eq!(urls.iter().filter(|url| url.ends_with("a.xapk?k=1")).count(), 1);
+    }
+
+    #[test]
+    fn several_descriptors_get_numbered_file_names() {
+        assert_eq!(descriptor_file_name("p@1@arm64-v8a", "XAPKJ", 0, 1), "p@1@arm64-v8a.xapk");
+        assert_eq!(descriptor_file_name("p@1", "APKJ", 1, 2), "p@1.variant2.apk");
     }
 }
 

@@ -22,3 +22,17 @@ You can also list the versions available, either specifying a specific architect
 apkeep -l -a com.instagram.android -o 'arch=x86'
 apkeep -l -a com.instagram.android
 ```
+
+APKPure picks the variant it serves from the device's SDK level, and by default this tool reports SDK 29. Pass `sdk=` to request the variant for another SDK level (one to three digits; anything else keeps 29):
+
+```shell
+apkeep -a com.instagram.android@1.2.3 -d apk-pure -o 'acknowledge_dangers=true,arch=x86_64,sdk=35' .
+```
+
+For a specific version, APKPure can list several downloads (for example, an APK and an XAPK, or builds for different architectures). By default only the first is saved. Pass `all_variants=true` to save every distinct download. When there is more than one, the files are named `<app>.variant<N>.apk` or `<app>.variant<N>.xapk`:
+
+```shell
+apkeep -a com.instagram.android@1.2.3 -d apk-pure -o 'acknowledge_dangers=true,all_variants=true' .
+```
+
+`all_variants` applies only when a version is given; a latest-version download always saves one file.
