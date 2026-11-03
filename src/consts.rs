@@ -1,4 +1,7 @@
 pub const APKPURE_VERSIONS_URL_FORMAT: &str = "https://api.pureapk.com/m/v3/cms/app_version?hl=en-US&package_name=";
+/// The SHA-1 field that follows each version record's version string in an
+/// APKPure versions response; the record's download descriptors follow it.
+pub const APKPURE_VERSION_MARKER_REGEX: &str = r":\([[:xdigit:]]{40,}";
 pub const APKPURE_DOWNLOAD_URL_REGEX: &str = r"(X?APKJ)..(https?://(www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))";
 pub const FDROID_REPO: &str = "https://f-droid.org/repo";
 pub const FDROID_INDEX_FINGERPRINT: &[u8] = &[67, 35, 141, 81, 44, 30, 94, 178, 214, 86, 159, 74, 58, 251, 245, 82, 52, 24, 184, 46, 10, 62, 209, 85, 39, 112, 171, 185, 169, 201, 204, 171];

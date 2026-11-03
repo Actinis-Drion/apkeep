@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::ops::Deref;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -62,23 +61,67 @@ fn all_variants(options: &HashMap<&str, &str>) -> bool {
     matches!(options.get("all_variants"), Some(val) if *val == "1" || val.to_lowercase() == "true")
 }
 
-/// The (kind, URL) of each download descriptor `re` finds in `body`, in the
-/// order APKPure lists them, without repeats; only the first unless `all`.
-fn download_descriptors(re: &Regex, body: &str, all: bool) -> Vec<(String, String)> {
+/// The parts of `body` that belong to the records of exactly `version`, in
+/// the order APKPure lists them. Each runs from the end of a record's version
+/// marker to the start of the next record's, so it holds every descriptor of
+/// that record and none of another version's.
+fn version_records<'a>(marker: &Regex, body: &'a str, version: &str) -> Vec<&'a str> {
+    let markers: Vec<_> = marker.find_iter(body).collect();
+    markers
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| names_version(&body[..m.start()], version))
+        .map(|(i, m)| {
+            let end = markers.get(i + 1).map_or(body.len(), |next| next.start());
+            &body[m.end()..end]
+        })
+        .collect()
+}
+
+/// True when `prefix`, the text before a version marker, ends with the whole
+/// version string `version`. APKPure frames the string with its one-byte
+/// length, so `2.3` does not match a `1.2.3` record; a version too long for a
+/// one-byte length cannot be checked that way and only has to match.
+fn names_version(prefix: &str, version: &str) -> bool {
+    let Some(rest) = prefix.strip_suffix(version) else {
+        return false;
+    };
+    match u8::try_from(version.len()) {
+        Ok(0) => false,
+        Ok(len @ 1..=127) => rest.ends_with(char::from(len)),
+        _ => true,
+    }
+}
+
+/// The (kind, URL) of each download descriptor `re` finds in `regions`, in
+/// the order APKPure lists them, without repeats; only the first unless `all`.
+fn download_descriptors<'a>(re: &Regex, regions: impl IntoIterator<Item = &'a str>, all: bool) -> Vec<(String, String)> {
     let mut seen = HashSet::new();
     let mut descriptors = Vec::new();
-    for caps in re.captures_iter(body) {
-        let (Some(kind), Some(url)) = (caps.get(1), caps.get(2)) else {
-            continue;
-        };
-        if seen.insert(url.as_str().to_string()) {
-            descriptors.push((kind.as_str().to_string(), url.as_str().to_string()));
-            if !all {
-                break;
+    for region in regions {
+        for caps in re.captures_iter(region) {
+            let (Some(kind), Some(url)) = (caps.get(1), caps.get(2)) else {
+                continue;
+            };
+            if seen.insert(url.as_str().to_string()) {
+                descriptors.push((kind.as_str().to_string(), url.as_str().to_string()));
+                if !all {
+                    return descriptors;
+                }
             }
         }
     }
     descriptors
+}
+
+/// The descriptors to download from a versions response `body`: for an exact
+/// `version`, those in its records (every one if `all`, else the first); for
+/// the latest version, the first one listed.
+fn select_descriptors(download: &Regex, marker: &Regex, body: &str, version: Option<&str>, all: bool) -> Vec<(String, String)> {
+    match version {
+        Some(version) => download_descriptors(download, version_records(marker, body, version), all),
+        None => download_descriptors(download, [body], false),
+    }
 }
 
 /// The file name for descriptor `index` of `count`: numbered only when there
@@ -116,12 +159,14 @@ pub async fn download_apps(
     let all_variants = all_variants(&options);
     let headers = http_headers(&options);
     let re = Rc::new(Regex::new(crate::consts::APKPURE_DOWNLOAD_URL_REGEX).unwrap());
+    let marker = Rc::new(Regex::new(crate::consts::APKPURE_VERSION_MARKER_REGEX).unwrap());
 
     futures_util::stream::iter(
         apps.into_iter().map(|app| {
             let (app_id, app_version) = app;
             let http_client = Rc::clone(&http_client);
             let re = Rc::clone(&re);
+            let marker = Rc::clone(&marker);
             let headers = headers.clone();
             let mp = Rc::clone(&mp);
             let mp_log = Rc::clone(&mp);
@@ -152,24 +197,19 @@ pub async fn download_apps(
                     .get(versions_url)
                     .headers(headers)
                     .send().await.unwrap();
-                if let Some(app_version) = app_version {
-                    let regex_string = format!("[[:^digit:]]{}:(?s:.)+?{}", regex::escape(&app_version), crate::consts::APKPURE_DOWNLOAD_URL_REGEX);
-                    let re = Regex::new(&regex_string).unwrap();
-                    download_from_response(versions_response, Box::new(Box::new(re)), app_string, outpath, mp, all_variants).await;
-                } else {
-                    download_from_response(versions_response, Box::new(re), app_string, outpath, mp, false).await;
-                }
+                let select = |body: &str| select_descriptors(&re, &marker, body, app_version.as_deref(), all_variants);
+                download_from_response(versions_response, select, app_string, outpath, mp).await;
             }
         })
     ).buffer_unordered(parallel).collect::<Vec<()>>().await;
 }
 
-async fn download_from_response(response: Response, re: Box<dyn Deref<Target=Regex>>, app_string: String, outpath: &Path, mp: Rc<MultiProgress>, all: bool) {
+async fn download_from_response(response: Response, select: impl Fn(&str) -> Vec<(String, String)>, app_string: String, outpath: &Path, mp: Rc<MultiProgress>) {
     let mp_log = Rc::clone(&mp);
     match response.status() {
         reqwest::StatusCode::OK => {
             let body = response.text().await.unwrap();
-            let descriptors = download_descriptors(&re, &body, all);
+            let descriptors = select(&body);
             if descriptors.is_empty() {
                 mp_log.println(format!("Could not get download URL for {}. Skipping...", app_string)).unwrap();
                 return;
@@ -257,37 +297,75 @@ mod tests {
         assert!(all_variants(&options(&[("all_variants", "1")])));
     }
 
-    const BODY: &str = "\u{12}1.2.3:\u{8}XAPKJ\u{1}\u{2}https://d.example.com/a.xapk?k=1\u{0} \
-        \u{12}1.2.3:\u{8}XAPKJ\u{1}\u{2}https://d.example.com/b.xapk?k=2\u{0} \
-        \u{12}1.2.3:\u{8}XAPKJ\u{1}\u{2}https://d.example.com/a.xapk?k=1\u{0} \
-        \u{12}1.2.4:\u{8}APKJ\u{1}\u{2}https://d.example.com/c.apk\u{0}";
+    /// A version record as APKPure frames it: the length-prefixed version
+    /// string, its SHA-1 marker, then one descriptor per `(kind, url)`.
+    fn record(version: &str, descriptors: &[(&str, &str)]) -> String {
+        let mut record = format!("\u{1a}\u{0}2{}{}:({}\u{8}", char::from(version.len() as u8), version, "ab".repeat(20));
+        for (kind, url) in descriptors {
+            record.push_str(&format!("B\u{4}{kind}\u{fffd}\u{3}{url}\u{0}"));
+        }
+        record
+    }
 
-    fn version_regex(version: &str) -> Regex {
-        Regex::new(&format!(
-            "[[:^digit:]]{}:(?s:.)+?{}",
-            regex::escape(version),
-            crate::consts::APKPURE_DOWNLOAD_URL_REGEX
-        ))
-        .unwrap()
+    const A: &str = "https://d.example.com/a.xapk?k=1";
+    const B: &str = "https://d.example.com/b.apk?k=2";
+    const C: &str = "https://d.example.com/c.xapk?k=3";
+    const NEWER: &str = "https://d.example.com/newer.apk";
+    const OLDER: &str = "https://d.example.com/older.apk";
+
+    fn body() -> String {
+        [
+            record("1.2.4", &[("APKJ", NEWER)]),
+            record("1.2.3", &[("XAPKJ", A), ("APKJ", B)]),
+            record("1.2.3", &[("XAPKJ", C), ("XAPKJ", A)]),
+            record("2.3", &[]),
+            record("1.2.2", &[("APKJ", OLDER)]),
+        ]
+        .concat()
+    }
+
+    fn select(version: Option<&str>, all: bool) -> Vec<(String, String)> {
+        let download = Regex::new(crate::consts::APKPURE_DOWNLOAD_URL_REGEX).unwrap();
+        let marker = Regex::new(crate::consts::APKPURE_VERSION_MARKER_REGEX).unwrap();
+        select_descriptors(&download, &marker, &body(), version, all)
+    }
+
+    fn urls(descriptors: Vec<(String, String)>) -> Vec<String> {
+        descriptors.into_iter().map(|(_, url)| url).collect()
     }
 
     #[test]
-    fn the_first_descriptor_alone_by_default() {
-        let found = download_descriptors(&version_regex("1.2.3"), BODY, false);
-        assert_eq!(found, vec![("XAPKJ".to_string(), "https://d.example.com/a.xapk?k=1".to_string())]);
+    fn the_first_descriptor_of_the_version_alone_by_default() {
+        assert_eq!(select(Some("1.2.3"), false), vec![("XAPKJ".to_string(), A.to_string())]);
     }
 
     #[test]
-    fn every_distinct_descriptor_of_the_version_with_all_variants() {
-        let urls: Vec<String> = download_descriptors(&version_regex("1.2.3"), BODY, true)
-            .into_iter()
-            .map(|(_, url)| url)
-            .collect();
-        assert!(urls.starts_with(&[
-            "https://d.example.com/a.xapk?k=1".to_string(),
-            "https://d.example.com/b.xapk?k=2".to_string(),
-        ]));
-        assert_eq!(urls.iter().filter(|url| url.ends_with("a.xapk?k=1")).count(), 1);
+    fn every_distinct_descriptor_of_every_record_of_the_version_with_all_variants() {
+        assert_eq!(urls(select(Some("1.2.3"), true)), vec![A, B, C]);
+        assert_eq!(select(Some("1.2.3"), true)[1].0, "APKJ");
+    }
+
+    #[test]
+    fn another_versions_descriptors_are_never_taken() {
+        assert!(select(Some("2.3"), true).is_empty());
+        assert!(select(Some("1.2"), true).is_empty());
+        assert!(select(Some("9.9.9"), false).is_empty());
+        assert_eq!(urls(select(Some("1.2.2"), true)), vec![OLDER]);
+    }
+
+    #[test]
+    fn the_latest_version_takes_the_first_descriptor_listed() {
+        assert_eq!(urls(select(None, true)), vec![NEWER]);
+    }
+
+    #[test]
+    fn a_version_must_carry_its_own_length_prefix() {
+        assert!(names_version("\u{0}2\u{5}1.2.3", "1.2.3"));
+        assert!(!names_version("\u{0}2\u{5}1.2.3", "2.3"));
+        assert!(!names_version("\u{0}2\u{6}11.2.3", "1.2.3"));
+        assert!(!names_version("\u{0}2\u{0}", ""));
+        let long = "1".repeat(200);
+        assert!(names_version(&format!("x{long}"), &long));
     }
 
     #[test]
